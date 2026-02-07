@@ -15,6 +15,10 @@ DEFAULT_CHUNK = 100
 DEFAULT_OUT_SHEET_INDEX = 0
 DEFAULT_ID_COL = "A"  # A파일 상품아이디 기본값(필요시 사이드바에서 변경)
 
+# b 템플릿에서 삭제할 행(엑셀 기준)
+ROWS_TO_DELETE_1BASED = [1, 3, 4]  # 1행, 3행, 4행
+
+
 # =========================
 # Utils
 # =========================
@@ -30,11 +34,6 @@ def uniq_keep_order(seq):
 
 
 def extract_bracket_items(val):
-    """
-    - [ ... ] 블록 여러 개면 각각 추출
-    - 블록 내부 콤마 있으면 추가 분리
-    - 대괄호 없으면 콤마 분리 폴백
-    """
     if pd.isna(val):
         return []
     s = str(val).strip()
@@ -63,9 +62,6 @@ def extract_bracket_items(val):
 
 
 def build_aw_cell(main_items, detail_items):
-    """
-    AW 셀 = main + detail_1~detail_9 를 줄바꿈(Alt+Enter)로 한 셀에 저장
-    """
     lines = []
     if main_items:
         lines.append(f"main^|^https://m.lastorder.in/{main_items[0]}")
@@ -75,10 +71,6 @@ def build_aw_cell(main_items, detail_items):
 
 
 def validate_a_df(a: pd.DataFrame, id_col_letter: str):
-    """
-    새 규칙에서 필요한 A 컬럼:
-    C, D(상품명), E(옵션값), H, J, M(재고), P(판매종료일), S(main 이미지), T(detail 이미지), + 상품아이디
-    """
     required = ["C", "D", "E", "H", "J", "M", "P", "S", "T", id_col_letter]
     max_needed = max(col_idx(c) for c in required)
     if a.shape[1] <= max_needed:
@@ -91,13 +83,39 @@ def split_rows(rows: list[dict], chunk_size: int):
     return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)] or [[]]
 
 
+def get_template_bytes(optional_uploaded):
+    """
+    1순위: 업로드 템플릿(선택)
+    2순위: app(1).py와 같은 폴더의 b.xlsx
+    """
+    if optional_uploaded is not None:
+        return optional_uploaded.getvalue()
+
+    local_path = Path("b.xlsx")
+    if local_path.exists():
+        return local_path.read_bytes()
+
+    raise FileNotFoundError(
+        "b.xlsx 템플릿을 찾을 수 없습니다. "
+        "app(1).py와 같은 폴더에 b.xlsx를 두거나, 템플릿을 업로드하세요."
+    )
+
+
 def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index: int, start_row: int = 2):
     """
-    b.xlsx 템플릿(전체 시트/탭 유지)에 rows를 sheet_index 시트 start_row부터 값으로 기입
+    - b.xlsx 템플릿의 모든 탭(시트) 유지
+    - 지정 시트(sheet_index)에서만:
+        1) 1행, 3행, 4행 삭제
+        2) start_row부터 rows 값을 기입
     """
     wb = load_workbook(BytesIO(template_bytes))
     ws = wb.worksheets[sheet_index]
 
+    # ✅ 행 삭제는 큰 번호부터 삭제해야 인덱스 꼬임이 없음
+    for r in sorted(ROWS_TO_DELETE_1BASED, reverse=True):
+        ws.delete_rows(r, 1)
+
+    # 값 기입
     for i, row in enumerate(rows):
         excel_row = start_row + i
         for col_letter, val in row.items():
@@ -114,7 +132,7 @@ def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index:
 # =========================
 def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     """
-    ✅ 최종 규칙
+    ✅ 최종 규칙 + 추가 변경
 
     B 매핑:
     - A = 1
@@ -122,8 +140,8 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     - C = 1011307
     - G = A:D (상품명)
     - J = 'n'
-    - M = 판매종료일(P) 있으면 2 / 없으면 1   (옵션그룹은 그룹 최소 기준)
-    - O = P값, 없으면 2999-12-31              (옵션그룹은 그룹 최소)
+    - M = 판매종료일(P) 있으면 2 / 없으면 1 (옵션그룹은 그룹 최소 기준)
+    - O = P값, 없으면 2999-12-31 (옵션그룹은 그룹 최소)
     - S = A:H
     - T = (A:H - A:J) 계산 결과 + "-1" 문자열
     - AP = P에서 날짜만 (옵션그룹은 그룹 최소의 날짜)
@@ -137,15 +155,16 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     - AB = 'y'
     - AC = '선택'
     - AD = 옵션값(A:E) ^|^ 연결 (중복 제거, 등장순)
-    - AG = 옵션재고(A:M)  (AD 옵션 순서에 맞춰 ^|^ 연결)
+    - AG = 옵션재고(A:M) (AD 옵션 순서에 맞춰 ^|^ 연결)
+
+    ✅ 추가요구:
+    - 비옵션 상품 재고수량: W열에 A:M 단일 재고값 입력
     """
 
-    # 상품아이디
     pid = a.iloc[:, col_idx(id_col_letter)].astype(str).fillna("").str.strip()
     is_dup = pid.duplicated(keep=False)
     option_pids = set(pid[is_dup])
 
-    # 대표행(각 pid 첫 행) — 인덱스 reset으로 매칭 뒤틀림 방지
     rep_mask = ~pid.duplicated(keep="first")
     a_rep = a.loc[rep_mask].reset_index(drop=True)
     pid_rep = pid.loc[rep_mask].reset_index(drop=True)
@@ -154,7 +173,7 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     p_all_dt = pd.to_datetime(a.iloc[:, col_idx("P")], errors="coerce")
     p_min_map = p_all_dt.groupby(pid).min()
 
-    # 옵션값(E) (중복 제거, 등장 순) -> AD
+    # 옵션값(E) -> AD
     e_series = a.iloc[:, col_idx("E")]
     opt_value_map = (
         pd.DataFrame({"pid": pid, "opt": e_series})
@@ -165,7 +184,7 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
         .to_dict()
     )
 
-    # 옵션재고(M) -> AG (옵션값 순서에 맞춰 매칭해서 ^|^)
+    # 옵션재고(M) -> AG (옵션값 순서에 맞춰 ^|^)
     m_stock_series = a.iloc[:, col_idx("M")]
     df_opt = pd.DataFrame({"pid": pid, "opt": e_series, "stk": m_stock_series})
 
@@ -196,13 +215,11 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     def group_images(pid_value: str):
         mask = (pid == pid_value).to_numpy()
 
-        # main: S에서 첫 유효 아이템 1개
         main_candidates = []
         for sv in s_img[mask]:
             main_candidates.extend(extract_bracket_items(sv))
         main_candidates = [x for x in main_candidates if x]
 
-        # detail: T에서 전체 합쳐 중복 제거
         detail_candidates = []
         for tv in t_img[mask]:
             detail_candidates.extend(extract_bracket_items(tv))
@@ -210,29 +227,23 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
 
         return main_candidates, detail_candidates
 
-    out_rows = []
-
     # 숫자계산용 (대표행 기준)
     h_num = pd.to_numeric(a_rep.iloc[:, col_idx("H")], errors="coerce").fillna(0).to_numpy()
     j_num = pd.to_numeric(a_rep.iloc[:, col_idx("J")], errors="coerce").fillna(0).to_numpy()
 
+    out_rows = []
     for i in range(len(a_rep)):
         pid_i = pid_rep.iloc[i]
         is_option = pid_i in option_pids
 
         row = {}
-
-        # 고정
         row["A"] = 1
         row["B"] = 217089
         row["C"] = 1011307
         row["J"] = "n"
 
-        # 상품명
-        row["G"] = a_rep.iloc[:, col_idx("D")].to_numpy()[i]
-
-        # S = A:H
-        row["S"] = a_rep.iloc[:, col_idx("H")].to_numpy()[i]
+        row["G"] = a_rep.iloc[:, col_idx("D")].to_numpy()[i]  # 상품명
+        row["S"] = a_rep.iloc[:, col_idx("H")].to_numpy()[i]  # A:H -> B:S
 
         # T = (H - J) + "-1"
         row["T"] = f"{int(h_num[i] - j_num[i])}-1"
@@ -254,9 +265,13 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
             row["O"] = d
             row["AP"] = d
 
-        # 이미지 AW (옵션이든 아니든 group_images 사용)
+        # AW 이미지
         main_items, detail_items = group_images(pid_i)
         row["AW"] = build_aw_cell(main_items, detail_items)
+
+        # ✅ 비옵션 재고: W = A:M
+        if not is_option:
+            row["W"] = a_rep.iloc[:, col_idx("M")].to_numpy()[i]
 
         # 옵션 처리
         if is_option:
@@ -264,11 +279,6 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
             row["AC"] = "선택"
             row["AD"] = opt_value_map.get(pid_i, "")
             row["AG"] = opt_stock_map.get(pid_i, "")
-        else:
-            # 비옵션 재고도 AG에 단일 M값을 넣고 싶다면 아래 주석을 해제하세요.
-            # 요구사항은 "옵션재고"이므로 기본은 비워둡니다.
-            # row["AG"] = a_rep.iloc[:, col_idx("M")].to_numpy()[i]
-            pass
 
         out_rows.append(row)
 
@@ -279,16 +289,15 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
 # Streamlit UI
 # =========================
 st.set_page_config(page_title="A→B 변환기(최종)", layout="wide")
-st.title("📦 A파일 → B템플릿(b.xlsx) 자동 변환기 (최종본)")
+st.title("📦 A파일 → B템플릿(b.xlsx) 자동 변환기 (최종)")
 
-with st.expander("사용 방법", expanded=True):
+with st.expander("동작 요약", expanded=True):
     st.write(
-        "1) **B 템플릿(b.xlsx)** 업로드\n"
-        "2) **A 파일 여러 개** 업로드(폴더처럼 드래그&드롭 가능)\n"
-        "3) 변환 시작 → 결과 ZIP 다운로드\n\n"
-        "- 템플릿의 **모든 시트(아래 탭) 유지**\n"
-        "- 지정한 시트(기본 0번째)에 **2행부터 값만 채움**\n"
-        "- 옵션그룹은 상품아이디 중복으로 판단하여 **1행으로 묶음**\n"
+        "- 템플릿 업로드 없이도 **같은 폴더의 b.xlsx를 자동 사용**합니다.\n"
+        "- 출력 파일에서만 **1행/3행/4행을 삭제**하고, 그 뒤에 2행부터 데이터가 들어갑니다.\n"
+        "- 템플릿의 **탭/시트는 그대로 유지**됩니다.\n"
+        "- 비옵션 상품은 **W열에 재고(A:M)** 가 들어갑니다.\n"
+        "- 옵션 상품은 **AG열에 옵션재고(^|^)** 가 들어갑니다.\n"
     )
 
 st.sidebar.header("설정")
@@ -296,16 +305,20 @@ id_col_letter = st.sidebar.text_input("A파일 상품아이디 컬럼(엑셀 문
 chunk_size = st.sidebar.number_input("분할 저장(행)", min_value=10, max_value=5000, value=DEFAULT_CHUNK, step=10)
 sheet_index = st.sidebar.number_input("템플릿에 쓸 시트 인덱스(0=첫 시트)", min_value=0, max_value=30, value=DEFAULT_OUT_SHEET_INDEX, step=1)
 
-template_file = st.file_uploader("B 템플릿(b.xlsx) 업로드", type=["xlsx"])
+template_file = st.file_uploader("B 템플릿 업로드(선택)", type=["xlsx"])
 a_files = st.file_uploader("A파일 업로드(여러 개 가능)", type=["xlsx"], accept_multiple_files=True)
 
-run_btn = st.button("🚀 변환 시작", disabled=(template_file is None or not a_files))
+run_btn = st.button("🚀 변환 시작", disabled=not a_files)
 
 if run_btn:
     t0 = time.time()
     st.info("처리 중...")
 
-    template_bytes = template_file.getvalue()
+    try:
+        template_bytes = get_template_bytes(template_file)
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
     summary_rows = []
     error_rows = []
@@ -331,14 +344,14 @@ if run_btn:
                     raise ValueError(vmsg)
 
                 rows = make_b_rows_from_a(a_df, id_col_letter)
-
                 chunks = split_rows(rows, int(chunk_size))
+
                 for idx, chunk in enumerate(chunks, start=1):
                     out_xlsx = apply_rows_to_template(
                         template_bytes=template_bytes,
                         rows=chunk,
                         sheet_index=int(sheet_index),
-                        start_row=2
+                        start_row=2  # 행 삭제 후에도 2행부터 넣는 규칙 유지
                     )
                     out_name = f"{Path(uf.name).stem}_part{idx:03d}.xlsx"
                     zf.writestr(out_name, out_xlsx)
@@ -359,7 +372,6 @@ if run_btn:
                 "message": msg
             })
 
-        # 리포트 저장
         summary_df = pd.DataFrame(summary_rows)
         zf.writestr("summary_report.csv", summary_df.to_csv(index=False).encode("utf-8-sig"))
 
@@ -379,7 +391,7 @@ if run_btn:
         st.dataframe(pd.DataFrame(error_rows), use_container_width=True)
 
     st.download_button(
-        "📦 결과 ZIP 다운로드 (엑셀 + 리포트 포함)",
+        "📦 결과 ZIP 다운로드",
         data=zip_buf,
         file_name="B_result.zip",
         mime="application/zip"
