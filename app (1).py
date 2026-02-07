@@ -102,17 +102,12 @@ def get_template_bytes(optional_uploaded):
     )
 
 
-def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index: int, start_row_after_header: int = 2):
+def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index: int):
     """
     - 템플릿의 모든 탭(시트) 유지
     - 지정 시트(sheet_index)에서만:
         1) 1,3,4,5,6행 삭제 (2행=컬럼명 유지)
-        2) '컬럼명 행' 바로 아래(start_row_after_header)부터 rows 기입
-
-    중요:
-    - 행 삭제 후에는 엑셀 행 번호가 당겨지므로,
-      여기서는 "컬럼명은 남는다"만 보장하고,
-      데이터는 '컬럼명 아래'로 넣기 위해 start_row_after_header=2로 고정합니다.
+        2) 컬럼명 바로 아래(2행)부터 데이터 기입
     """
     wb = load_workbook(BytesIO(template_bytes))
     ws = wb.worksheets[sheet_index]
@@ -123,9 +118,8 @@ def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index:
             continue
         ws.delete_rows(r, 1)
 
-    # ✅ 컬럼명(원래 2행)이 남아있고, 삭제로 인해 보통 1행이 됨
-    # 그래서 "컬럼명 아래"인 2행부터 입력
-    start_row = start_row_after_header
+    # 삭제 후 컬럼명(원래 2행)이 보통 1행이 됨 → 데이터는 2행부터
+    start_row = 2
 
     for i, row in enumerate(rows):
         excel_row = start_row + i
@@ -139,29 +133,35 @@ def apply_rows_to_template(template_bytes: bytes, rows: list[dict], sheet_index:
 
 
 # =========================
-# Core transform (FINAL RULES + NEW CHANGES)
+# Core transform (FINAL)
 # =========================
-def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
+def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str, fixed_p, fixed_q, fixed_bc):
     """
-    B 매핑:
+    B 매핑(요청사항 기준):
+
     - A = 1
     - B = 217089
     - C = 1011307
     - G = A:D (상품명)
     - J = 'n'
-    - M = 판매종료일(P) 있으면 2 / 없으면 1 (옵션그룹은 그룹 최소 기준)
-    - O = P값, 없으면 2999-12-31 (옵션그룹은 그룹 최소)
-    - S = A:H
-    - T = (A:H - A:J) 결과 + "-1"
-    - W = (비옵션 재고) A:M
-    - AG = (옵션재고) A:M 을 옵션값 순서대로 ^|^
-    - AP = 유효일자(날짜만): P가 없으면 빈칸("")
+    - P = 사이드바 고정값
+    - Q = 사이드바 고정값
+    - BC = 사이드바 고정값
+
+    - M = 판매종료일(P열) 있으면 2 / 없으면 1 (옵션그룹은 그룹 최소 기준)
+    - O = 판매종료일 날짜(옵션그룹은 최소값), 없으면 2999-12-31
+    - AP = 유효일자(날짜만) / A의 P열 값 없으면 빈칸("")
     - AU = 항상 빈칸("")
     - AR, AS = A:C (C가 없으면 빈칸)
-    - AW = 이미지(main + detail_1~9 줄바꿈) 옵션그룹은 전체 합쳐 중복 제거
+    - S = A:H
+    - T = (A:H - A:J) 결과 + "-1"
 
-    옵션그룹:
+    - W = 비옵션 재고: A:M
+    - AW = 이미지(main + detail_1~9, 줄바꿈) / 옵션그룹은 그룹 전체 합쳐 중복제거
+
+    옵션그룹(상품아이디 중복):
     - AB='y', AC='선택', AD=옵션값(E)^|^
+    - AG=옵션재고(M) (AD 옵션 순서에 맞춰 ^|^)
     """
 
     pid = a.iloc[:, col_idx(id_col_letter)].astype(str).fillna("").str.strip()
@@ -173,7 +173,7 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
     a_rep = a.loc[rep_mask].reset_index(drop=True)
     pid_rep = pid.loc[rep_mask].reset_index(drop=True)
 
-    # 그룹 최소 판매종료일
+    # 그룹 최소 판매종료일 (A의 P열)
     p_all_dt = pd.to_datetime(a.iloc[:, col_idx("P")], errors="coerce")
     p_min_map = p_all_dt.groupby(pid).min()
 
@@ -241,10 +241,17 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
         is_option = pid_i in option_pids
 
         row = {}
+
+        # 고정값
         row["A"] = 1
         row["B"] = 217089
         row["C"] = 1011307
         row["J"] = "n"
+
+        # ✅ 사이드바 고정값
+        row["P"] = fixed_p
+        row["Q"] = fixed_q
+        row["BC"] = fixed_bc
 
         # 상품명
         row["G"] = a_rep.iloc[:, col_idx("D")].to_numpy()[i]
@@ -260,16 +267,19 @@ def make_b_rows_from_a(a: pd.DataFrame, id_col_letter: str):
 
         # AR/AS = A:C (없으면 빈칸)
         c_raw = a_rep.iloc[:, col_idx("C")].to_numpy()[i]
-        c_str = "" if pd.isna(c_raw) or str(c_raw).strip().lower() == "nan" or str(c_raw).strip() == "" else c_raw
-        row["AR"] = c_str
-        row["AS"] = c_str
+        if pd.isna(c_raw) or str(c_raw).strip() == "" or str(c_raw).strip().lower() == "nan":
+            row["AR"] = ""
+            row["AS"] = ""
+        else:
+            row["AR"] = c_raw
+            row["AS"] = c_raw
 
         # 판매종료일: 그룹 최소값
         pmin = p_min_map.get(pid_i, pd.NaT)
         if pd.isna(pmin):
             row["M"] = 1
-            row["O"] = "2999-12-31"   # O는 기존 규칙 유지
-            row["AP"] = ""            # ✅ 변경: P 없으면 AP는 빈칸
+            row["O"] = "2999-12-31"
+            row["AP"] = ""           # ✅ P 없으면 AP는 빈칸
         else:
             d = pd.Timestamp(pmin).strftime("%Y-%m-%d")
             row["M"] = 2
@@ -307,14 +317,20 @@ with st.expander("동작 요약", expanded=True):
     st.write(
         "- 템플릿 업로드 없이도 **같은 폴더의 b.xlsx를 자동 사용**합니다.\n"
         "- 출력 파일(지정 시트)에서만 **1,3,4,5,6행 삭제**하고 **2행(컬럼명)은 유지**합니다.\n"
-        "- **AP는 P가 없으면 빈칸**, **AU는 항상 빈칸**, **C가 없으면 AR/AS는 빈칸**입니다.\n"
+        "- **AP는 A파일 P열이 없으면 빈칸**, **AU는 항상 빈칸**, **C가 없으면 AR/AS는 빈칸**입니다.\n"
         "- 비옵션은 **W=재고**, 옵션은 **AG=옵션재고(^|^)** 입니다.\n"
+        "- P/Q/BC는 사이드바에서 바꿀 수 있습니다.\n"
     )
 
 st.sidebar.header("설정")
 id_col_letter = st.sidebar.text_input("A파일 상품아이디 컬럼(엑셀 문자)", value=DEFAULT_ID_COL).strip().upper()
 chunk_size = st.sidebar.number_input("분할 저장(행)", min_value=10, max_value=5000, value=DEFAULT_CHUNK, step=10)
 sheet_index = st.sidebar.number_input("템플릿에 쓸 시트 인덱스(0=첫 시트)", min_value=0, max_value=30, value=DEFAULT_OUT_SHEET_INDEX, step=1)
+
+st.sidebar.subheader("고정 입력값 (B 템플릿)")
+fixed_p = st.sidebar.text_input("B의 P열 고정값", value="1").strip()
+fixed_q = st.sidebar.text_input("B의 Q열 고정값", value="15").strip()
+fixed_bc = st.sidebar.text_input("B의 BC열 고정값", value="").strip()
 
 template_file = st.file_uploader("B 템플릿 업로드(선택)", type=["xlsx"])
 a_files = st.file_uploader("A파일 업로드(여러 개 가능)", type=["xlsx"], accept_multiple_files=True)
@@ -354,7 +370,14 @@ if run_btn:
                 if not ok:
                     raise ValueError(vmsg)
 
-                rows = make_b_rows_from_a(a_df, id_col_letter)
+                rows = make_b_rows_from_a(
+                    a=a_df,
+                    id_col_letter=id_col_letter,
+                    fixed_p=fixed_p,
+                    fixed_q=fixed_q,
+                    fixed_bc=fixed_bc,
+                )
+
                 chunks = split_rows(rows, int(chunk_size))
 
                 for idx, chunk in enumerate(chunks, start=1):
@@ -362,7 +385,6 @@ if run_btn:
                         template_bytes=template_bytes,
                         rows=chunk,
                         sheet_index=int(sheet_index),
-                        start_row_after_header=2  # 컬럼명 아래로 입력
                     )
                     out_name = f"{Path(uf.name).stem}_part{idx:03d}.xlsx"
                     zf.writestr(out_name, out_xlsx)
